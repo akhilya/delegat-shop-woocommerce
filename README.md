@@ -19,6 +19,13 @@ In this folder:
 docker compose up -d --build
 ```
 
+Or use the published image (no local build):
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
 The first start can take a few minutes (it downloads WooCommerce). Watch progress:
 
 ```bash

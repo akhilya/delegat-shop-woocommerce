@@ -19,6 +19,13 @@
 docker compose up -d --build
 ```
 
+Или готовый образ без локальной сборки:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
 Первый запуск может занять несколько минут (скачивается WooCommerce). Смотреть прогресс:
 
 ```bash

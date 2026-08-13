@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!shop-entrypoint.sh
+!plugin
+!plugin/**

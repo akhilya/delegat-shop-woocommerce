@@ -90,7 +90,7 @@ wp option update delegat_bridge_api_key "${DELEGAT_API_KEY}" --allow-root
 
 wp wc product create --name="Sandbox product" --sku=delegat-sandbox --type=simple --regular_price=100 --status=publish --user="${WP_ADMIN_USER}" --allow-root || true
 
-chown -R 33:33 /var/www/html || true
+find /var/www/html -path '/var/www/html/wp-content/plugins/delegat-bridge' -prune -o -exec chown 33:33 {} + 2>/dev/null || true
 
 echo "READY"
 echo "Admin: ${SITE_URL}/wp-admin  (${WP_ADMIN_USER} / ${WP_ADMIN_PASSWORD})"

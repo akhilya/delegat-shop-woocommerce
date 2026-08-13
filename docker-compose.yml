@@ -65,7 +65,7 @@ services:
       - woo_html:/var/www/html
       - ./plugin/delegat-bridge:/var/www/html/wp-content/plugins/delegat-bridge:ro
       - ./init-wp.sh:/sandbox/init-wp.sh:ro
-    entrypoint: ["sh", "-c", "sed -i 's/\\r$//' /sandbox/init-wp.sh && sh /sandbox/init-wp.sh"]
+    entrypoint: ["sh", "-c", "tr -d '\\r' < /sandbox/init-wp.sh > /tmp/init-wp.sh && sh /tmp/init-wp.sh"]
     restart: on-failure
 
 volumes:

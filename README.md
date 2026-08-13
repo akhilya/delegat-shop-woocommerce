@@ -70,7 +70,7 @@ Edit `.env`, then `docker compose up -d` again. You do **not** need a `.env` fil
 
 Same `docker-compose.yml`. In Dokploy you only need: the Git repo, environment variables, and a domain. Do not add extra Traefik / network settings in the compose file.
 
-1. Connect this private GitHub repo.
+1. Connect this GitHub repo.
 2. New **Compose** app, file `docker-compose.yml`.
 3. Environment — copy `.env.example` and change at least:
    - `SITE_URL=https://woo.your.domain` — **no** slash at the end
@@ -114,4 +114,4 @@ git tag v1.2.1
 git push origin v1.2.1
 ```
 
-The image is private (same as this repo). `docker pull` needs `docker login ghcr.io`.
+Anyone can pull `ghcr.io/akhilya/delegat-shop-woocommerce:latest` without logging in.

@@ -217,9 +217,10 @@ final class Delegat_Bridge_Images
             }
             $local_id = (int) ($entry['local_product_id'] ?? 0);
             $woo_product_id = isset($entry['product_id']) ? absint($entry['product_id']) : 0;
+            $sku = isset($entry['sku']) ? trim((string) $entry['sku']) : '';
             $files = $entry['files'] ?? [];
             $source_urls = $entry['source_urls'] ?? [];
-            if (($local_id <= 0 && $woo_product_id <= 0) || !is_array($files) || $files === []) {
+            if (($local_id <= 0 && $woo_product_id <= 0 && $sku === '') || !is_array($files) || $files === []) {
                 continue;
             }
 
@@ -233,12 +234,21 @@ final class Delegat_Bridge_Images
             if (!$product && $local_id > 0) {
                 $product = self::find_product_by_delegat_id((string) $local_id);
             }
+            if (!$product && $sku !== '' && function_exists('wc_get_product_id_by_sku') && function_exists('wc_get_product')) {
+                $sku_pid = (int) wc_get_product_id_by_sku($sku);
+                if ($sku_pid > 0) {
+                    $candidate = wc_get_product($sku_pid);
+                    if ($candidate instanceof WC_Product) {
+                        $product = $candidate;
+                    }
+                }
+            }
             if (!$product) {
-                $errors[] = 'product not found for local_product_id=' . $local_id . ' product_id=' . $woo_product_id;
+                $errors[] = 'product not found for local_product_id=' . $local_id . ' product_id=' . $woo_product_id . ' sku=' . $sku;
                 continue;
             }
             $product_id = (int) $product->get_id();
-            $folder_key = $local_id > 0 ? (string) $local_id : ('w' . $product_id);
+            $folder_key = !empty($entry['folder']) ? basename((string) $entry['folder']) : ($local_id > 0 ? (string) $local_id : ('w' . $product_id));
 
             $attachment_ids = [];
             foreach ($files as $index => $filename) {
@@ -293,7 +303,7 @@ final class Delegat_Bridge_Images
                 }
                 $path_key = $source_url !== ''
                     ? self::source_path_key($source_url)
-                    : strtolower('archive:' . $folder_key . '/' . $filename);
+                    : strtolower('archive:p' . $product_id . ':' . hash('sha256', $bytes));
 
                 $existing = $source_url !== ''
                     ? self::find_by_source($source_url, $path_key)

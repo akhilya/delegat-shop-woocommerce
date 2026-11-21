@@ -623,17 +623,16 @@ final class Delegat_Bridge_Products
         }
 
         if ($variant_id !== null && $variant_id !== '') {
-            // Prefer WC variation ID if numeric; else Delegat variant meta under parent
+            // Prefer WC variation ID if numeric and owned by this parent; else Delegat variant meta under parent.
+            // Never fall back to updating the parent product when an explicit variant_id cannot be resolved.
             if (ctype_digit($variant_id)) {
                 $variation = wc_get_product((int) $variant_id);
-                if ($variation instanceof WC_Product_Variation) {
+                if ($variation instanceof WC_Product_Variation && (int) $variation->get_parent_id() === $pid) {
                     return $variation;
                 }
             }
             $found = self::find_variation($pid, $variant_id);
-            if ($found) {
-                return $found;
-            }
+            return $found ?: null;
         }
 
         $product = wc_get_product($pid);

@@ -83,6 +83,48 @@ final class Delegat_Bridge_REST
             'callback'            => [self::class, 'images_import_archive'],
             'permission_callback' => $auth,
         ]);
+
+        register_rest_route(self::NAMESPACE, '/prices', [
+            'methods'             => 'GET',
+            'callback'            => [Delegat_Bridge_Commerce::class, 'list_prices'],
+            'permission_callback' => $auth,
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/orders', [
+            'methods'             => 'GET',
+            'callback'            => [Delegat_Bridge_Commerce::class, 'list_orders'],
+            'permission_callback' => $auth,
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/orders/(?P<id>[\\d]+)', [
+            'methods'             => 'GET',
+            'callback'            => [Delegat_Bridge_Commerce::class, 'get_order'],
+            'permission_callback' => $auth,
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/orders/(?P<id>[\\d]+)/status', [
+            'methods'             => 'POST',
+            'callback'            => [Delegat_Bridge_Commerce::class, 'update_order_status'],
+            'permission_callback' => $auth,
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/promotions', [
+            'methods'             => 'GET',
+            'callback'            => [Delegat_Bridge_Commerce::class, 'list_promotions'],
+            'permission_callback' => $auth,
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/promotions/(?P<id>[\\d]+)', [
+            'methods'             => 'GET',
+            'callback'            => [Delegat_Bridge_Commerce::class, 'get_promotion'],
+            'permission_callback' => $auth,
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/promotions/(?P<id>[\\d]+)/products', [
+            'methods'             => 'POST',
+            'callback'            => [Delegat_Bridge_Commerce::class, 'update_promotion_products'],
+            'permission_callback' => $auth,
+        ]);
     }
 
     public static function health(): WP_REST_Response
@@ -110,6 +152,11 @@ final class Delegat_Bridge_REST
                 'images.async',
                 'images.drain',
                 'images.import_archive',
+                'prices.get',
+                'orders',
+                'orders.status',
+                'promotions',
+                'promotions.products',
             ],
         ]);
     }
@@ -424,6 +471,7 @@ final class Delegat_Bridge_REST
         if ($price === '' || $price === null) {
             $price = $product->get_price();
         }
+        $sale = $product->get_sale_price();
 
         $category_id = '';
         $category_name = null;
@@ -446,6 +494,7 @@ final class Delegat_Bridge_REST
             'name'           => $product->get_name(),
             'description'    => $product->get_description(),
             'price'          => $price !== '' && $price !== null ? (float) $price : null,
+            'sale_price'     => $sale !== '' && $sale !== null ? (float) $sale : null,
             'quantity'       => $product->get_manage_stock() ? (int) $product->get_stock_quantity() : null,
             'status'         => $product->get_status(),
             'image_urls'     => $image_urls,
@@ -508,6 +557,7 @@ final class Delegat_Bridge_REST
                 'images_mode'      => $upsert['images_mode'] ?? null,
                 'images_synced'    => $upsert['images_synced'] ?? null,
                 'image_errors'     => $upsert['image_errors'] ?? null,
+                'variant_ids'      => $upsert['variant_ids'] ?? null,
             ];
         }
 
@@ -573,18 +623,66 @@ final class Delegat_Bridge_REST
     {
         $files = $request->get_file_params();
         $file = $files['archive'] ?? null;
+        $tmp_created = null;
+
+        if (!is_array($file)) {
+            $body = $request->get_json_params();
+            $b64 = is_array($body) && isset($body['archive_base64']) && is_string($body['archive_base64'])
+                ? $body['archive_base64']
+                : '';
+            if ($b64 !== '') {
+                $raw = base64_decode($b64, true);
+                if ($raw === false || $raw === '') {
+                    return new WP_REST_Response([
+                        'success'       => false,
+                        'error'         => 'archive_base64 is not valid base64',
+                        'attached'      => 0,
+                        'skipped'       => 0,
+                        'errors'        => ['archive_base64 is not valid base64'],
+                        'pending_regen' => 0,
+                    ], 400);
+                }
+                $tmp_created = tempnam(sys_get_temp_dir(), 'delegat_img_');
+                if ($tmp_created === false || file_put_contents($tmp_created, $raw) === false) {
+                    if ($tmp_created !== false && is_file($tmp_created)) {
+                        @unlink($tmp_created);
+                    }
+                    return new WP_REST_Response([
+                        'success'       => false,
+                        'error'         => 'Failed to stage archive_base64 payload',
+                        'attached'      => 0,
+                        'skipped'       => 0,
+                        'errors'        => ['Failed to stage archive_base64 payload'],
+                        'pending_regen' => 0,
+                    ], 500);
+                }
+                $file = [
+                    'tmp_name' => $tmp_created,
+                    'error'    => UPLOAD_ERR_OK,
+                    'size'     => strlen($raw),
+                ];
+            }
+        }
+
         if (!is_array($file)) {
             return new WP_REST_Response([
                 'success'       => false,
-                'error'         => 'multipart field "archive" (zip) is required',
+                'error'         => 'multipart field "archive" (zip) or JSON "archive_base64" is required',
                 'attached'      => 0,
                 'skipped'       => 0,
-                'errors'        => ['multipart field "archive" (zip) is required'],
+                'errors'        => ['multipart field "archive" (zip) or JSON "archive_base64" is required'],
                 'pending_regen' => 0,
             ], 400);
         }
 
-        $result = Delegat_Bridge_Images::import_archive_from_upload($file);
+        try {
+            $result = Delegat_Bridge_Images::import_archive_from_upload($file);
+        } finally {
+            if ($tmp_created !== null && is_file($tmp_created)) {
+                @unlink($tmp_created);
+            }
+        }
+
         $status = !empty($result['success']) ? 200 : 207;
         return new WP_REST_Response([
             'success'        => !empty($result['success']),

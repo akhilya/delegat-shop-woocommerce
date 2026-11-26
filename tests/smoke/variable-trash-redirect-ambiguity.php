@@ -162,8 +162,42 @@ try {
     );
     echo "smoke: trash-only parent owner cannot become a guessed redirect\n";
 
+    // A child that reuses the trash-only parent SKU has no visible pre-write
+    // conflict, but the parent save claims that SKU before the child write.
+    $parent_child_collision_payload = $payload;
+    $parent_child_collision_payload['variants'] = [
+        [
+            'variant_id' => 'parent-sku-child',
+            'sku'        => $parent_sku,
+            'attributes' => ['Size' => 'Small'],
+        ],
+    ];
+    smoke_assert_ambiguous(
+        smoke_card_resolution($parent_child_collision_payload),
+        $initial_id,
+        $owner_id,
+        'child reusing the trash-only parent SKU'
+    );
+    smoke_assert_rest_ambiguous(
+        $parent_child_collision_payload,
+        $initial_id,
+        $owner_id,
+        'child reusing the trash-only parent SKU'
+    );
+    echo "smoke: parent-SKU claim exposes a hidden child collision\n";
+
     $live_parent_sku = 'SMOKE-LIVE-PARENT-' . $suffix;
     $live_child_sku = 'SMOKE-LIVE-CHILD-' . $suffix;
+    $live_trash_owner_id = smoke_create_variable_product('Smoke live-owner trash duplicate ' . $suffix, ['Small']);
+    $live_trash_variation = smoke_create_variation(
+        $live_trash_owner_id,
+        'live-owner-trash-duplicate',
+        $live_parent_sku,
+        'Small'
+    );
+    $live_trash_product = wc_get_product($live_trash_variation);
+    smoke_assert($live_trash_product instanceof WC_Product_Variation, 'live-owner trash duplicate was not created');
+    $live_trash_product->delete(false);
     $live_owner_id = smoke_create_variable_product('Smoke live retry owner ' . $suffix, ['Blue'], $live_parent_sku);
     smoke_create_variation($live_owner_id, 'live-blue', $live_child_sku, 'Blue');
     $redirect_payload = [
@@ -248,22 +282,23 @@ try {
     // initial parent: another catalog target behind the duplicated row still
     // makes the retry ownership state ambiguous.
     $initial_duplicate_sku = 'SMOKE-INITIAL-DUP-' . $suffix;
-    $initial_duplicate_owner_id = smoke_create_variable_product('Smoke initial duplicate owner ' . $suffix, ['Small']);
-    $initial_duplicate_variation = smoke_create_variation(
-        $initial_duplicate_owner_id,
-        'initial-duplicate-trashed-parent-sku',
-        $initial_duplicate_sku,
-        'Small'
+    $initial_duplicate_owner_id = smoke_create_variable_product(
+        'Smoke initial duplicate owner ' . $suffix,
+        ['Small'],
+        $initial_duplicate_sku . '-OTHER'
     );
-    $initial_duplicate_product = wc_get_product($initial_duplicate_variation);
-    smoke_assert($initial_duplicate_product instanceof WC_Product_Variation, 'initial duplicate trash variation was not created');
-    $initial_duplicate_product->delete(false);
     $updated = $wpdb->update(
         $lookup,
         ['sku' => $initial_duplicate_sku],
         ['product_id' => $initial_id]
     );
     smoke_assert($updated === 1, 'initial duplicate lookup fixture did not update the initial parent SKU');
+    $updated = $wpdb->update(
+        $lookup,
+        ['sku' => $initial_duplicate_sku],
+        ['product_id' => $initial_duplicate_owner_id]
+    );
+    smoke_assert($updated === 1, 'initial duplicate lookup fixture did not update the second parent SKU');
 
     $initial_duplicate_payload = [
         'product_id'  => $initial_id,

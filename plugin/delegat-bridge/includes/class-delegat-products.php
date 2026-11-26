@@ -775,9 +775,11 @@ final class Delegat_Bridge_Products
     }
 
     /**
-     * Catalog product ids named by one SKU in the lookup table, with variation
-     * rows normalized to their parents just like the write retry does. More
-     * than one id means LIMIT 1 cannot provide an honest redirect target.
+     * Catalog product ids eligible to be selected for one SKU by the write
+     * retry, with variation rows normalized to their parents. Non-trash rows
+     * shadow the trash-inclusive fallback exactly as find_by_sku does. More
+     * than one id in the applicable tier means LIMIT 1 cannot provide an
+     * honest redirect target.
      *
      * @return int[]
      */
@@ -786,17 +788,31 @@ final class Delegat_Bridge_Products
         global $wpdb;
         $lookup = $wpdb->prefix . 'wc_product_meta_lookup';
         // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-        $ids = $wpdb->get_col($wpdb->prepare(
-            "SELECT DISTINCT CASE
-                WHEN posts.post_type = 'product_variation' AND parent_posts.ID IS NOT NULL THEN posts.post_parent
-                ELSE posts.ID
-            END
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT DISTINCT
+                CASE
+                    WHEN posts.post_type = 'product_variation' AND parent_posts.ID IS NOT NULL THEN posts.post_parent
+                    ELSE posts.ID
+                END AS catalog_target_id,
+                CASE WHEN posts.post_status = 'trash' THEN 0 ELSE 1 END AS primary_lookup
             FROM {$lookup} AS lookup
             INNER JOIN {$wpdb->posts} AS posts ON posts.ID = lookup.product_id
             LEFT JOIN {$wpdb->posts} AS parent_posts ON parent_posts.ID = posts.post_parent
             WHERE lookup.sku = %s",
             $sku
         ));
+
+        $primary_ids = [];
+        $fallback_ids = [];
+        foreach ((array) $rows as $row) {
+            $id = (int) $row->catalog_target_id;
+            if ((int) $row->primary_lookup === 1) {
+                $primary_ids[] = $id;
+            } else {
+                $fallback_ids[] = $id;
+            }
+        }
+        $ids = $primary_ids !== [] ? $primary_ids : $fallback_ids;
 
         return array_values(array_unique(array_map('intval', $ids)));
     }
@@ -827,7 +843,12 @@ final class Delegat_Bridge_Products
         if (!self::variable_card_may_have_sku_collision($payload)) {
             return 'initial';
         }
-        if (!self::variable_write_has_sku_conflict((int) $target->get_id(), $variants)) {
+        $hidden_parent_sku_collision = !$owner_can_conflict
+            && !empty($payload['sku'])
+            && self::variable_child_reuses_parent_sku($payload, $variants);
+        if (!self::variable_write_has_sku_conflict((int) $target->get_id(), $variants)
+            && !$hidden_parent_sku_collision
+        ) {
             return 'initial';
         }
 
@@ -861,6 +882,32 @@ final class Delegat_Bridge_Products
         }
         foreach ($variants as $variant) {
             if (is_array($variant) && !empty($variant['sku'])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether a writable child row uses the parent SKU. When that parent SKU
+     * is trash-only before the write, the parent save claims it first and the
+     * child then collides with the parent even though the pre-write lookup did
+     * not show a child-SKU conflict.
+     *
+     * @param array<string, mixed> $payload
+     * @param array<int, mixed>      $variants
+     */
+    private static function variable_child_reuses_parent_sku(array $payload, array $variants): bool
+    {
+        $parent_sku = (string) $payload['sku'];
+        foreach ($variants as $variant) {
+            if (!is_array($variant)) {
+                continue;
+            }
+            if ((string) ($variant['variant_id'] ?? '') === '' || empty($variant['sku'])) {
+                continue;
+            }
+            if ((string) $variant['sku'] === $parent_sku) {
                 return true;
             }
         }

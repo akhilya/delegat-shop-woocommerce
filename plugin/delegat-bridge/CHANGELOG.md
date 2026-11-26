@@ -9,6 +9,10 @@ Version numbers match the plugin header. Distribution tags are created in this r
 
 ## [Unreleased]
 
+### Fixed
+
+- Variable card target resolution no longer predicts a SKU-conflict redirect when the post-save SKU state names multiple distinct live parent products, or when the parent save itself claims the SKU before a child collision and leaves no different live retry parent. The fallback SKU lookup is deterministic, and unresolved retry ownership is reported as explicit `ambiguous` plus `possible_ids` evidence while a sole live owner remains a deterministic redirect.
+
 ## [1.3.4] - 2026-11-25
 
 ### Added

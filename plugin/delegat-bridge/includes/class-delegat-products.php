@@ -99,7 +99,7 @@ final class Delegat_Bridge_Products
             $lookup = $wpdb->prefix . 'wc_product_meta_lookup';
             // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
             $id = (int) $wpdb->get_var($wpdb->prepare(
-                "SELECT product_id FROM {$lookup} WHERE sku = %s LIMIT 1",
+                "SELECT product_id FROM {$lookup} WHERE sku = %s ORDER BY product_id ASC LIMIT 1",
                 $sku
             ));
         }
@@ -719,23 +719,28 @@ final class Delegat_Bridge_Products
                 if ($owner) {
                     $owner_can_conflict = self::sku_owner_conflicts_with_write($owner);
                     $owner = self::normalize_to_catalog_product($owner);
-                    if ((int) $owner->get_id() !== (int) $target->get_id()) {
-                        if (!$has_variants) {
-                            if ($owner_can_conflict) {
-                                $target = $owner;
-                                $sku_conflict_redirect = true;
-                            }
-                        } else {
-                            $variable_target = self::resolve_variable_sku_target($target, $owner, $payload);
+                    $owner_is_initial = (int) $owner->get_id() === (int) $target->get_id();
+                    if (!$has_variants) {
+                        if (!$owner_is_initial && $owner_can_conflict) {
+                            $target = $owner;
+                            $sku_conflict_redirect = true;
+                        }
+                    } else {
+                        $sku_parent_ids = self::variable_live_sku_parent_ids_after_parent_save($target, $payload, $sku);
+                        if (!$owner_is_initial || count($sku_parent_ids) > 1) {
+                            $variable_target = self::resolve_variable_sku_target($target, $payload, $sku_parent_ids);
                             if ($variable_target === 'redirect') {
                                 $target = $owner;
                                 $sku_conflict_redirect = true;
                             } elseif ($variable_target === 'ambiguous') {
                                 $ambiguous = true;
-                                $possible_ids = array_values(array_unique([
-                                    (string) $target->get_id(),
-                                    (string) $owner->get_id(),
-                                ]));
+                                $possible_ids = array_values(array_unique(array_merge(
+                                    [
+                                        (string) $target->get_id(),
+                                        (string) $owner->get_id(),
+                                    ],
+                                    array_map('strval', $sku_parent_ids)
+                                )));
                                 $target = null;
                             }
                         }
@@ -764,18 +769,81 @@ final class Delegat_Bridge_Products
     }
 
     /**
+     * Live catalog parents named by the submitted SKU after the parent-write
+     * portion of a variable save. Variations are normalized to their parents
+     * because that is the object upsert_variable retries. The comparison stays
+     * in SQL, exactly like the lookup used by the writer. Trash rows are not
+     * retry candidates while any live row is present, but a matching row stored
+     * on the target matters because saving the target publishes it again.
+     *
+     * @param array<string, mixed> $payload
+     * @return int[]
+     */
+    private static function variable_live_sku_parent_ids_after_parent_save(WC_Product $target, array $payload, string $sku): array
+    {
+        global $wpdb;
+        $lookup = $wpdb->prefix . 'wc_product_meta_lookup';
+        $target_id = (int) $target->get_id();
+
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT lookup.product_id, posts.post_type, posts.post_status, posts.post_parent
+            FROM {$lookup} AS lookup
+            INNER JOIN {$wpdb->posts} AS posts ON posts.ID = lookup.product_id
+            WHERE lookup.sku = %s
+            ORDER BY lookup.product_id ASC",
+            $sku
+        ));
+
+        $parent_ids = [];
+        $has_live_blocker = false;
+        $target_row_matches = false;
+        foreach ((array) $rows as $row) {
+            $product_id = (int) $row->product_id;
+            if ($product_id === $target_id) {
+                $target_row_matches = true;
+            }
+            if ($row->post_status === 'trash') {
+                continue;
+            }
+            if ($product_id !== $target_id) {
+                // WooCommerce excludes only the product row being saved from
+                // its uniqueness check; even a variation under the same parent
+                // still blocks that parent from claiming the SKU.
+                $has_live_blocker = true;
+            }
+
+            $parent_ids[] = $row->post_type === 'product_variation' && (int) $row->post_parent > 0
+                ? (int) $row->post_parent
+                : $product_id;
+        }
+
+        // A matching target row becomes or remains nontrash after the save
+        // even when another live row makes set_sku fail. Without a live
+        // blocker, set_sku itself makes the target a claimant.
+        if ($target_row_matches || (!empty($payload['sku']) && !$has_live_blocker)) {
+            $parent_ids[] = $target_id;
+        }
+
+        $parent_ids = array_values(array_unique(array_map('intval', $parent_ids)));
+        sort($parent_ids, SORT_NUMERIC);
+        return $parent_ids;
+    }
+
+    /**
      * Resolve the variable-card branch of a SKU-owner mismatch. A parent SKU
      * conflict itself is swallowed by apply_common; only a child variation SKU
      * conflict can invoke upsert_variable's retry against the parent SKU owner.
      * With full child rows we mirror that collision check against the current
-     * database for both the initial parent and the retry parent. Without those
-     * rows, or when neither parent can accept the child SKUs, neither side is
-     * honest canonical write evidence.
+     * database for the initial parent and the single live retry parent. Several
+     * distinct live parents — or a retry lookup that falls outside the live
+     * tier — cannot support one honest redirect target.
      *
      * @param array<string, mixed> $payload
+     * @param int[]                $sku_parent_ids
      * @return 'initial'|'redirect'|'ambiguous'
      */
-    private static function resolve_variable_sku_target(WC_Product $target, WC_Product $owner, array $payload): string
+    private static function resolve_variable_sku_target(WC_Product $target, array $payload, array $sku_parent_ids): string
     {
         $variants = $payload['variants'] ?? null;
         if (!is_array($variants)) {
@@ -784,13 +852,25 @@ final class Delegat_Bridge_Products
         if (!self::variable_card_may_have_sku_collision($payload)) {
             return 'initial';
         }
+
         if (!self::variable_write_has_sku_conflict((int) $target->get_id(), $variants)) {
             return 'initial';
+        }
+
+        if (count($sku_parent_ids) !== 1) {
+            return 'ambiguous';
+        }
+
+        $retry_parent_id = (int) $sku_parent_ids[0];
+        if ($retry_parent_id === (int) $target->get_id()) {
+            // Retrying the parent whose child write just collided cannot be a
+            // redirect to fresh canonical write evidence.
+            return 'ambiguous';
         }
         if (self::variable_conflict_follows_sku_claim((int) $target->get_id(), $variants)) {
             return 'ambiguous';
         }
-        if (!self::variable_write_has_sku_conflict((int) $owner->get_id(), $variants)) {
+        if (!self::variable_write_has_sku_conflict($retry_parent_id, $variants)) {
             return 'redirect';
         }
         return 'ambiguous';

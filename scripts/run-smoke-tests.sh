@@ -29,7 +29,7 @@ compose() {
 }
 
 cleanup() {
-    compose down -v --remove-orphans >/dev/null 2>&1 || true
+    compose down -v --remove-orphans --rmi local >/dev/null 2>&1 || true
 }
 
 trap cleanup EXIT INT TERM

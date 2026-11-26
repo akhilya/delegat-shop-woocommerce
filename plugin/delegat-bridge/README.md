@@ -22,6 +22,7 @@ All routes require `X-Delegat-Api-Key` or `Authorization: Bearer <key>`.
 | POST | `/categories/upsert` | Create/update category |
 | GET | `/categories/{id}/fields` | Default product fields |
 | POST | `/products/upsert` | Create/update simple or variable product |
+| GET | `/products?ids=1,2,3` | Batch product lookup (`products.batch_get` capability); ids with no WooCommerce product object (including permanent deletion) are omitted from `items` and echoed in `missing_ids`. Trashed products keep the exact single-read behavior and are returned with `status: trash` |
 | POST | `/products/bulk` | Bulk upsert |
 | POST | `/prices/bulk` | Update prices |
 | POST | `/stocks/bulk` | Update stocks |

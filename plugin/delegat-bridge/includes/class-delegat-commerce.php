@@ -47,14 +47,69 @@ final class Delegat_Bridge_Commerce
             $query_args['page'] = 1;
         }
 
-        $product_ids = wc_get_products($query_args);
+        $include_variations = filter_var($request->get_param('include_variations'), FILTER_VALIDATE_BOOLEAN);
+
+        // exact=1 is the write-faithful confirmation lookup: it resolves each
+        // requested id directly through wc_get_product with no post-status
+        // filter, mirroring the eligibility of the mutation path (which accepts
+        // scheduled/draft/private products by id). Omission from an exact
+        // response therefore means the write target genuinely does not exist,
+        // unlike the legacy status-filtered listing used for catalog sync.
+        $exact = filter_var($request->get_param('exact'), FILTER_VALIDATE_BOOLEAN);
+        if ($exact && $ids !== []) {
+            $product_ids = $ids;
+        } else {
+            $product_ids = wc_get_products($query_args);
+        }
         $items = [];
         foreach ($product_ids as $product_id) {
             $product = wc_get_product((int) $product_id);
             if (!$product) {
                 continue;
             }
-            $items[] = self::price_payload($product);
+            $payload = self::price_payload($product);
+            if ($include_variations && $product->is_type('variable')) {
+                $variants = [];
+                // In exact (write-faithful) mode the variation list must mirror
+                // the mutation path's eligibility: resolve_target accepts an
+                // owned numeric variation id with no post-status check, so a
+                // draft/pending variation the write can still target must not
+                // be invisible here. get_children() filters to published and
+                // private statuses, which would turn a writable variation's
+                // omission into false non-landing evidence. The legacy
+                // catalog-sync mode keeps the status-filtered child list.
+                // WordPress 'any' silently excludes trash, yet the mutation
+                // path accepts an owned numeric variation id with no status
+                // check at all — including a trashed one. Write-faithful
+                // readback must therefore enumerate every registered status
+                // explicitly so no writable variation is invisible.
+                $variation_ids = $exact && $ids !== []
+                    ? get_posts([
+                        'post_type'      => 'product_variation',
+                        'post_parent'    => (int) $product->get_id(),
+                        'post_status'    => array_values(get_post_stati()),
+                        'fields'         => 'ids',
+                        'posts_per_page' => -1,
+                        'orderby'        => 'ID',
+                        'order'          => 'ASC',
+                    ])
+                    : $product->get_children();
+                foreach ($variation_ids as $variation_id) {
+                    $variation = wc_get_product((int) $variation_id);
+                    if (!$variation instanceof WC_Product_Variation) {
+                        continue;
+                    }
+                    $variant_payload = self::price_payload($variation);
+                    $delegat_variant_id = get_post_meta((int) $variation->get_id(), Delegat_Bridge_Products::META_VARIANT_ID, true);
+                    $variant_payload['variant_id'] = is_string($delegat_variant_id) && $delegat_variant_id !== ''
+                        ? $delegat_variant_id
+                        : null;
+                    $variant_payload['parent_product_id'] = (string) $product->get_id();
+                    $variants[] = $variant_payload;
+                }
+                $payload['variants'] = $variants;
+            }
+            $items[] = $payload;
         }
 
         return new WP_REST_Response([
@@ -62,6 +117,12 @@ final class Delegat_Bridge_Commerce
             'items'    => $items,
             'page'     => $page,
             'has_more' => $ids === [] && count($items) >= $page_size,
+            // Echo the resolution mode so the caller can distinguish a genuine
+            // exact-ID absence (write-faithful evidence) from a legacy
+            // status-filtered omission (inconclusive). Bridges predating this
+            // field never applied exact mode, and its absence must be read as
+            // the legacy filtered semantics.
+            'exact'    => $exact && $ids !== [],
         ]);
     }
 
@@ -293,12 +354,30 @@ final class Delegat_Bridge_Commerce
     {
         $regular = $product->get_regular_price();
         $sale = $product->get_sale_price();
+        $qty_edit = $product->get_stock_quantity('edit');
         return [
             'external_product_id' => (string) $product->get_id(),
             'sku'                 => (string) $product->get_sku(),
             'price'               => $regular !== '' ? (float) $regular : ($product->get_price() !== '' ? (float) $product->get_price() : null),
             'sale_price'          => $sale !== '' ? (float) $sale : null,
             'quantity'            => $product->get_manage_stock() ? (int) $product->get_stock_quantity() : null,
+            // Confirmation-grade stock evidence: view-context getters inherit
+            // the parent's quantity and manage flag for variations whose stock
+            // is managed at the parent level, so end-state confirmation must
+            // never trust them. quantity_edit is the variation's own stored
+            // quantity (no parent fallback) and stock_managed_by_id tells which
+            // product actually holds the stock counter.
+            'quantity_edit'       => $qty_edit === null ? null : (int) $qty_edit,
+            'stock_managed_by_id' => (string) $product->get_stock_managed_by_id(),
+            // The raw manage flag is exposed alongside the managed-by id so
+            // confirmation never has to infer local management from the
+            // stored quantity: quantity_edit is the raw stored meta even when
+            // management is off, and a matching number there is not evidence
+            // the write landed unless WooCommerce actually tracks the stock.
+            // Do not cast this value: variations can legitimately return the
+            // string 'parent', which is truthy in PHP but is not local stock
+            // management. Parents/simple products return boolean false/true.
+            'manage_stock'        => $product->get_manage_stock(),
         ];
     }
 

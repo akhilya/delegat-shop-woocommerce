@@ -54,6 +54,12 @@ final class Delegat_Bridge_REST
             'permission_callback' => $auth,
         ]);
 
+        register_rest_route(self::NAMESPACE, '/products', [
+            'methods'             => 'GET',
+            'callback'            => [self::class, 'list_products'],
+            'permission_callback' => $auth,
+        ]);
+
         register_rest_route(self::NAMESPACE, '/products/bulk', [
             'methods'             => 'POST',
             'callback'            => [self::class, 'upsert_products_bulk'],
@@ -69,6 +75,12 @@ final class Delegat_Bridge_REST
         register_rest_route(self::NAMESPACE, '/stocks/bulk', [
             'methods'             => 'POST',
             'callback'            => [self::class, 'stocks_bulk'],
+            'permission_callback' => $auth,
+        ]);
+
+        register_rest_route(self::NAMESPACE, '/resolve', [
+            'methods'             => 'POST',
+            'callback'            => [self::class, 'resolve_rows'],
             'permission_callback' => $auth,
         ]);
 
@@ -145,6 +157,7 @@ final class Delegat_Bridge_REST
                 'category.fields',
                 'products.upsert',
                 'products.get',
+                'products.batch_get',
                 'products.bulk',
                 'prices.bulk',
                 'stocks.bulk',
@@ -157,8 +170,68 @@ final class Delegat_Bridge_REST
                 'orders.status',
                 'promotions',
                 'promotions.products',
+                'resolve',
             ],
         ]);
+    }
+
+    /**
+     * Read-only canonical target resolution for batch preparation. Card rows
+     * are resolved with the exact precedence of the upsert write path
+     * (product_id, then _delegat_product_id meta, then sku) plus the outgoing
+     * simple/variable branch (`has_variants`), because only simple writes
+     * redirect on a parent-SKU conflict while variable writes ignore that
+     * conflict. Mutation rows use the exact precedence of the price/stock
+     * write path (numeric WC variation id owned by the parent first, then
+     * Delegat variant meta under the parent). The adapter uses mutation hits
+     * to canonicalize strict ownership aliases before duplicate detection.
+     * Card evidence remains shape-faithful, but SKU redirects and cross-form
+     * card aliases are not duplicate identity in the batch contract. This
+     * endpoint never mutates anything.
+     */
+    public static function resolve_rows(WP_REST_Request $request): WP_REST_Response
+    {
+        $body = $request->get_json_params();
+        if (!is_array($body) || !isset($body['rows']) || !is_array($body['rows'])) {
+            return new WP_REST_Response(['success' => false, 'error' => 'rows array is required'], 400);
+        }
+        if (count($body['rows']) > 500) {
+            return new WP_REST_Response(['success' => false, 'error' => 'at most 500 rows per resolve request'], 400);
+        }
+
+        $results = [];
+        foreach ($body['rows'] as $index => $row) {
+            $out = [
+                'index'                 => (int) $index,
+                'found'                 => false,
+                'canonical_id'          => null,
+                'sku_conflict_redirect' => false,
+            ];
+            if (is_array($row)) {
+                $kind = (string) ($row['kind'] ?? '');
+                if ($kind === 'card') {
+                    $resolution = Delegat_Bridge_Products::resolve_card_target_with_evidence($row);
+                    $product = $resolution['product'];
+                    if ($product) {
+                        $out['found'] = true;
+                        $out['canonical_id'] = (string) $product->get_id();
+                        $out['sku_conflict_redirect'] = (bool) $resolution['sku_conflict_redirect'];
+                    }
+                } elseif ($kind === 'mutation') {
+                    $product = Delegat_Bridge_Products::resolve_mutation_target(
+                        (string) ($row['product_id'] ?? ''),
+                        isset($row['variant_id']) ? (string) $row['variant_id'] : null
+                    );
+                    if ($product) {
+                        $out['found'] = true;
+                        $out['canonical_id'] = (string) $product->get_id();
+                    }
+                }
+            }
+            $results[] = $out;
+        }
+
+        return new WP_REST_Response(['success' => true, 'results' => $results], 200);
     }
 
     public static function list_categories(WP_REST_Request $request): WP_REST_Response
@@ -453,6 +526,96 @@ final class Delegat_Bridge_REST
             return new WP_REST_Response(['success' => false, 'error' => 'Product not found'], 404);
         }
 
+        return new WP_REST_Response(
+            array_merge(['success' => true], self::product_payload($product)),
+            200
+        );
+    }
+
+    /**
+     * Batch product lookup used by import fan-in. Rows are deliberately
+     * independent: one id whose product object no longer resolves (including
+     * permanent deletion) is reported in missing_ids and never turns the whole
+     * lookup into a 404. Trashed products keep the same visibility as the
+     * single read and are returned with their trash status. Found rows use the
+     * exact payload shape of GET /products/{id}; variable parents and
+     * variations therefore expose the same fields as the existing single read.
+     */
+    public static function list_products(WP_REST_Request $request): WP_REST_Response
+    {
+        if (!function_exists('wc_get_product')) {
+            return new WP_REST_Response(['success' => false, 'error' => 'WooCommerce is not active'], 500);
+        }
+
+        $ids_param = $request->get_param('ids');
+        if (!is_string($ids_param) || trim($ids_param) === '') {
+            return new WP_REST_Response(['success' => false, 'error' => 'ids query parameter is required'], 400);
+        }
+
+        $ids = [];
+        $seen = [];
+        $int_max = (string) PHP_INT_MAX;
+        foreach (explode(',', $ids_param) as $part) {
+            $token = trim($part);
+            if (!preg_match('/^\d+$/', $token)) {
+                return new WP_REST_Response([
+                    'success' => false,
+                    'error'   => 'ids query parameter contains an invalid product id',
+                ], 400);
+            }
+
+            // Leading zeroes are an alias of the same numeric id, but they must
+            // not defeat the integer range check. Reject zero and out-of-range
+            // tokens explicitly instead of letting PHP casting change their meaning.
+            $digits = ltrim($token, '0');
+            if ($digits === ''
+                || strlen($digits) > strlen($int_max)
+                || (strlen($digits) === strlen($int_max) && strcmp($digits, $int_max) > 0)
+            ) {
+                return new WP_REST_Response([
+                    'success' => false,
+                    'error'   => 'ids query parameter contains an invalid product id',
+                ], 400);
+            }
+
+            $id = (int) $digits;
+            if (isset($seen[$id])) {
+                continue;
+            }
+            $seen[$id] = true;
+            $ids[] = $id;
+        }
+
+        if ($ids === []) {
+            return new WP_REST_Response([
+                'success' => false,
+                'error'   => 'ids query parameter must contain at least one numeric product id',
+            ], 400);
+        }
+
+        $items = [];
+        $missing_ids = [];
+        foreach ($ids as $id) {
+            $product = wc_get_product($id);
+            if (!$product) {
+                $missing_ids[] = (string) $id;
+                continue;
+            }
+            $items[] = self::product_payload($product);
+        }
+
+        return new WP_REST_Response([
+            'success'     => true,
+            'items'       => $items,
+            'missing_ids' => $missing_ids,
+        ], 200);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function product_payload(WC_Product $product): array
+    {
         $image_ids = $product->get_gallery_image_ids();
         $featured = $product->get_image_id();
         if ($featured) {
@@ -487,8 +650,7 @@ final class Delegat_Bridge_REST
             }
         }
 
-        return new WP_REST_Response([
-            'success'        => true,
+        return [
             'product_id'     => (string) $product->get_id(),
             'sku'            => (string) $product->get_sku(),
             'name'           => $product->get_name(),
@@ -500,7 +662,7 @@ final class Delegat_Bridge_REST
             'image_urls'     => $image_urls,
             'category_id'    => $category_id !== '' ? $category_id : null,
             'category_name'  => $category_name,
-        ], 200);
+        ];
     }
 
     public static function upsert_product(WP_REST_Request $request): WP_REST_Response
@@ -587,20 +749,45 @@ final class Delegat_Bridge_REST
 
         $results = [];
         foreach ($body['prices'] as $index => $item) {
-            if (!is_array($item)) {
-                $results[] = ['index' => (int) $index, 'success' => false, 'error' => 'Invalid item'];
-                continue;
+            try {
+                if (!is_array($item)) {
+                    $results[] = ['index' => (int) $index, 'success' => false, 'error' => 'Invalid item'];
+                    continue;
+                }
+                $update = Delegat_Bridge_Products::update_price($item);
+                $results[] = [
+                    'index'      => (int) $index,
+                    'success'    => !empty($update['success']),
+                    'product_id' => $update['product_id'] ?? ($item['product_id'] ?? null),
+                    'error'      => $update['error'] ?? null,
+                ];
+            } catch (Throwable $e) {
+                // One bad row must not abort the request after earlier rows committed:
+                // the adapter can only reconcile siblings when every row has a verdict.
+                // The boolean verdict is deliberately OMITTED here, not false:
+                // WooCommerce persists the product inside save() before running
+                // after-save hooks, so an exception thrown from such a hook means
+                // the write may already have committed. Reporting a definitive
+                // failure would skip end-state confirmation of a row that landed.
+                $results[] = [
+                    'index'      => (int) $index,
+                    'uncertain'  => true,
+                    'product_id' => is_array($item) ? ($item['product_id'] ?? null) : null,
+                    'error'      => $e->getMessage(),
+                ];
             }
-            $update = Delegat_Bridge_Products::update_price($item);
-            $results[] = [
-                'index'      => (int) $index,
-                'success'    => !empty($update['success']),
-                'product_id' => $update['product_id'] ?? ($item['product_id'] ?? null),
-                'error'      => $update['error'] ?? null,
-            ];
         }
 
-        $all_ok = !in_array(false, array_column($results, 'success'), true);
+        // The batch is fully successful only when every row carries an explicit
+        // success=true; an uncertain or missing verdict must degrade the batch
+        // to 207 partial evidence so the adapter reconciles the row.
+        $all_ok = count($results) > 0;
+        foreach ($results as $r) {
+            if (empty($r['success'])) {
+                $all_ok = false;
+                break;
+            }
+        }
         return new WP_REST_Response([
             'success' => $all_ok,
             'results' => $results,
@@ -703,20 +890,43 @@ final class Delegat_Bridge_REST
 
         $results = [];
         foreach ($body['stocks'] as $index => $item) {
-            if (!is_array($item)) {
-                $results[] = ['index' => (int) $index, 'success' => false, 'error' => 'Invalid item'];
-                continue;
+            try {
+                if (!is_array($item)) {
+                    $results[] = ['index' => (int) $index, 'success' => false, 'error' => 'Invalid item'];
+                    continue;
+                }
+                $update = Delegat_Bridge_Products::update_stock($item);
+                $results[] = [
+                    'index'      => (int) $index,
+                    'success'    => !empty($update['success']),
+                    'product_id' => $update['product_id'] ?? ($item['product_id'] ?? null),
+                    'error'      => $update['error'] ?? null,
+                ];
+            } catch (Throwable $e) {
+                // Keep committed siblings attributable: every input row receives
+                // its own result even when one row throws inside WooCommerce.
+                // The boolean verdict is deliberately OMITTED here, not false:
+                // an exception from a WooCommerce after-save hook fires after the
+                // row already committed, so a definitive failure verdict would
+                // falsely skip end-state confirmation of a write that landed.
+                $results[] = [
+                    'index'      => (int) $index,
+                    'uncertain'  => true,
+                    'product_id' => is_array($item) ? ($item['product_id'] ?? null) : null,
+                    'error'      => $e->getMessage(),
+                ];
             }
-            $update = Delegat_Bridge_Products::update_stock($item);
-            $results[] = [
-                'index'      => (int) $index,
-                'success'    => !empty($update['success']),
-                'product_id' => $update['product_id'] ?? ($item['product_id'] ?? null),
-                'error'      => $update['error'] ?? null,
-            ];
         }
 
-        $all_ok = !in_array(false, array_column($results, 'success'), true);
+        // Fully successful only when every row carries explicit success=true;
+        // uncertain rows degrade the batch to 207 partial evidence.
+        $all_ok = count($results) > 0;
+        foreach ($results as $r) {
+            if (empty($r['success'])) {
+                $all_ok = false;
+                break;
+            }
+        }
         return new WP_REST_Response([
             'success' => $all_ok,
             'results' => $results,

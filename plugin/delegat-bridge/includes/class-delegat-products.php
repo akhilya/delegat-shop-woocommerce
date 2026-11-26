@@ -23,7 +23,7 @@ final class Delegat_Bridge_Products
             }
 
             $variants = $payload['variants'] ?? null;
-            $has_variants = is_array($variants) && count($variants) > 0;
+            $has_variants = self::payload_has_variants($payload);
 
             $product = self::find_existing($payload);
             if ($has_variants) {
@@ -34,6 +34,25 @@ final class Delegat_Bridge_Products
         } catch (Throwable $e) {
             return ['success' => false, 'error' => $e->getMessage()];
         }
+    }
+
+    /**
+     * The write branch is selected from the outgoing card shape, never from
+     * the type of product that already exists: a simple product can be
+     * converted to variable and vice versa. Read-only resolution receives the
+     * same shape as the explicit has_variants flag instead of the full
+     * variants array.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private static function payload_has_variants(array $payload, bool $include_resolution_flag = false): bool
+    {
+        $variants = $payload['variants'] ?? null;
+        if (is_array($variants)) {
+            return count($variants) > 0;
+        }
+
+        return $include_resolution_flag && !empty($payload['has_variants']);
     }
 
     /**
@@ -637,5 +656,80 @@ final class Delegat_Bridge_Products
 
         $product = wc_get_product($pid);
         return $product ?: null;
+    }
+
+    /**
+     * Read-only canonical resolution of a card upsert payload, using the exact
+     * precedence of the write path (product_id, then _delegat_product_id meta,
+     * then sku). Exposed so /resolve can report write-shape-faithful evidence;
+     * batch deduplication deliberately does not use cross-form card aliases as
+     * identity.
+     *
+     * @param array<string, mixed> $payload
+     */
+    public static function resolve_card_target(array $payload): ?WC_Product
+    {
+        $resolution = self::resolve_card_target_with_evidence($payload);
+        return $resolution['product'];
+    }
+
+    /**
+     * Canonical card target plus the reason-dependent evidence preparation
+     * needs. A SKU-conflict redirect is not the same kind of identity as a
+     * direct product/meta/SKU-resolution hit: another surviving card in the
+     * same batch may release that SKU before this write runs, so using the
+     * redirect target for deduplication can drop the release and overwrite the
+     * current owner. The endpoint therefore exposes the redirect separately;
+     * the batch contract treats every redirect as ordered sequential bridge
+     * behavior, never as duplicate identity.
+     *
+     * @param array<string, mixed> $payload
+     * @return array{product: ?WC_Product, sku_conflict_redirect: bool}
+     */
+    public static function resolve_card_target_with_evidence(array $payload): array
+    {
+        $target = self::find_existing($payload);
+        $sku_conflict_redirect = false;
+
+        // Mirror the write path's SKU-conflict correction using the OUTGOING
+        // card shape, not the existing product type. upsert_simple retries the
+        // save against the SKU owner whenever applying the submitted SKU
+        // collides — including when the write is converting an existing
+        // variable product back to simple. upsert_variable is the opposite
+        // branch: apply_common deliberately swallows a parent-SKU conflict, so
+        // a simple product being converted to variable must remain the target
+        // even when the submitted parent SKU belongs somewhere else. When the
+        // primary resolution already is the SKU owner this adjustment is a
+        // no-op.
+        $has_variants = self::payload_has_variants($payload, true);
+        if ($target && !$has_variants) {
+            $sku = isset($payload['sku']) ? trim((string) $payload['sku']) : '';
+            if ($sku !== '') {
+                $owner = self::find_by_sku($sku);
+                if ($owner) {
+                    $owner = self::normalize_to_catalog_product($owner);
+                    if ((int) $owner->get_id() !== (int) $target->get_id()) {
+                        $target = $owner;
+                        $sku_conflict_redirect = true;
+                    }
+                }
+            }
+        }
+
+        return [
+            'product'               => $target,
+            'sku_conflict_redirect' => $sku_conflict_redirect,
+        ];
+    }
+
+    /**
+     * Read-only canonical resolution of a price/stock mutation target, using
+     * the exact precedence of the write path (numeric WC variation id owned by
+     * the parent first, then Delegat variant meta scoped to the parent; never
+     * falling back to the parent when a variant_id is given).
+     */
+    public static function resolve_mutation_target(string $product_id, ?string $variant_id): ?WC_Product
+    {
+        return self::resolve_target($product_id, $variant_id);
     }
 }

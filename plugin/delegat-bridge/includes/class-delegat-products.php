@@ -787,6 +787,9 @@ final class Delegat_Bridge_Products
         if (!self::variable_write_has_sku_conflict((int) $target->get_id(), $variants)) {
             return 'initial';
         }
+        if (self::variable_conflict_follows_sku_claim((int) $target->get_id(), $variants)) {
+            return 'ambiguous';
+        }
         if (!self::variable_write_has_sku_conflict((int) $owner->get_id(), $variants)) {
             return 'redirect';
         }
@@ -810,6 +813,48 @@ final class Delegat_Bridge_Products
         foreach ($variants as $variant) {
             if (is_array($variant) && !empty($variant['sku'])) {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether the first predicted initial-parent SKU collision is preceded by
+     * a successful child SKU claim. save_variable commits earlier children
+     * before the collision and upsert_variable does not roll them back, so
+     * those claims still block the retry parent even when they were absent
+     * from the database during this read-only resolution.
+     *
+     * @param array<int, mixed> $variants
+     */
+    private static function variable_conflict_follows_sku_claim(int $parent_id, array $variants): bool
+    {
+        $prior_claim = false;
+        $seen_sku_variant_ids = [];
+        foreach ($variants as $variant) {
+            if (!is_array($variant)) {
+                continue;
+            }
+            $delegat_variant_id = (string) ($variant['variant_id'] ?? '');
+            if ($delegat_variant_id === '' || empty($variant['sku'])) {
+                continue;
+            }
+            $sku = (string) $variant['sku'];
+            $duplicate_distinct_child = isset($seen_sku_variant_ids[$sku])
+                && $seen_sku_variant_ids[$sku] !== $delegat_variant_id;
+            $seen_sku_variant_ids[$sku] = $delegat_variant_id;
+
+            $target_variation = self::find_variation($parent_id, $delegat_variant_id);
+            $owner = self::find_by_sku($sku);
+            $self_owned = $target_variation && $owner
+                && (int) $target_variation->get_id() === (int) $owner->get_id();
+            $conflicts = $duplicate_distinct_child
+                || ($owner && self::sku_owner_conflicts_with_write($owner) && !$self_owned);
+            if ($conflicts) {
+                return $prior_claim;
+            }
+            if (!$self_owned) {
+                $prior_claim = true;
             }
         }
         return false;

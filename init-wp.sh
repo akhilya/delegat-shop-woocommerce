@@ -10,6 +10,7 @@ WP_ADMIN_PASSWORD="${WP_ADMIN_PASSWORD:-admin}"
 WP_ADMIN_EMAIL="${WP_ADMIN_EMAIL:-admin@example.com}"
 WP_TITLE="${WP_TITLE:-Delegat WooCommerce shop}"
 DELEGAT_API_KEY="${DELEGAT_API_KEY:-delegat-woo-sandbox-api-key-local}"
+WOOCOMMERCE_VERSION="${WOOCOMMERCE_VERSION:-latest}"
 
 echo "Waiting for WordPress files..."
 n=0
@@ -64,7 +65,11 @@ EOF
 
 if ! wp plugin is-installed woocommerce --allow-root; then
   echo "Installing WooCommerce (WordPress.org)..."
-  wp plugin install woocommerce --activate --allow-root
+  if [ "$WOOCOMMERCE_VERSION" = "latest" ]; then
+    wp plugin install woocommerce --activate --allow-root
+  else
+    wp plugin install woocommerce --version="$WOOCOMMERCE_VERSION" --activate --allow-root
+  fi
 else
   wp plugin activate woocommerce --allow-root || true
 fi

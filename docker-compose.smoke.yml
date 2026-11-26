@@ -1,0 +1,31 @@
+services:
+  wordpress:
+    ports: !reset []
+
+  wp-init:
+    environment:
+      WOOCOMMERCE_VERSION: ${SMOKE_WOOCOMMERCE_VERSION:-10.9.4}
+
+  smoke:
+    image: wordpress:cli-php8.2
+    user: "0:0"
+    working_dir: /var/www/html
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: ${MYSQL_USER:-wordpress}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD:-wordpress}
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE:-wordpress}
+    depends_on:
+      db:
+        condition: service_healthy
+      wordpress:
+        condition: service_started
+    volumes:
+      - woo_html:/var/www/html
+      - ./tests/smoke:/tests/smoke:ro
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "tr -d '\\r' < /tests/smoke/variable-trash-redirect-ambiguity.php > /tmp/smoke.php && wp eval-file /tmp/smoke.php --allow-root",
+      ]

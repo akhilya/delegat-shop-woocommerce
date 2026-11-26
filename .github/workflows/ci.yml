@@ -11,6 +11,20 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  bridge-checks:
+    name: Bridge PHP checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dockerized PHP lint
+        run: sh scripts/lint-php.sh
+
+      - name: Dockerized bridge smoke tests
+        run: sh scripts/run-smoke-tests.sh
+
   shop-image:
     name: Shop image
     runs-on: ubuntu-latest

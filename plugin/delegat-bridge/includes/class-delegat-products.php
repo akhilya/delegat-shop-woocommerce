@@ -719,14 +719,15 @@ final class Delegat_Bridge_Products
                 if ($owner) {
                     $owner_can_conflict = self::sku_owner_conflicts_with_write($owner);
                     $owner = self::normalize_to_catalog_product($owner);
-                    if ((int) $owner->get_id() !== (int) $target->get_id()) {
-                        if (!$has_variants) {
-                            if ($owner_can_conflict) {
-                                $target = $owner;
-                                $sku_conflict_redirect = true;
-                            }
-                        } else {
-                            $sku_catalog_target_ids = self::sku_catalog_target_ids($sku);
+                    $owner_is_initial = (int) $owner->get_id() === (int) $target->get_id();
+                    if (!$has_variants) {
+                        if (!$owner_is_initial && $owner_can_conflict) {
+                            $target = $owner;
+                            $sku_conflict_redirect = true;
+                        }
+                    } else {
+                        $sku_catalog_target_ids = self::sku_catalog_target_ids($sku);
+                        if (!$owner_is_initial || count($sku_catalog_target_ids) > 1) {
                             $variable_target = self::resolve_variable_sku_target(
                                 $target,
                                 $owner,
@@ -734,7 +735,7 @@ final class Delegat_Bridge_Products
                                 $owner_can_conflict,
                                 $sku_catalog_target_ids
                             );
-                            if ($variable_target === 'redirect') {
+                            if ($variable_target === 'redirect' && !$owner_is_initial) {
                                 $target = $owner;
                                 $sku_conflict_redirect = true;
                             } elseif ($variable_target === 'ambiguous') {

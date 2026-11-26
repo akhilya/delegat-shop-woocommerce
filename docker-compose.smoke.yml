@@ -1,5 +1,6 @@
 services:
   wordpress:
+    image: !reset null
     ports: !reset []
 
   wp-init:

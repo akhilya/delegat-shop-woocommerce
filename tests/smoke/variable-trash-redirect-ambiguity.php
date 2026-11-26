@@ -190,28 +190,32 @@ try {
     smoke_assert($rest_redirect['ambiguous'] === false, 'REST live-owner redirect was ambiguous');
     echo "smoke: live parent owner remains a deterministic redirect\n";
 
-    // Pre-existing duplicated lookup rows are ambiguous even when the live row
-    // would be a writable retry parent: LIMIT 1 still cannot represent every
-    // catalog target named by the duplicated SKU.
+    // Pre-existing duplicated live lookup rows are ambiguous: LIMIT 1 cannot
+    // represent every catalog target named by the duplicated SKU. The direct
+    // lookup update intentionally reproduces legacy/corrupt duplication that
+    // WooCommerce's normal uniqueness guard cannot create.
     $duplicate_parent_sku = 'SMOKE-DUP-PARENT-' . $suffix;
     $duplicate_child_sku = 'SMOKE-DUP-CHILD-' . $suffix;
-    $duplicate_trash_owner_id = smoke_create_variable_product('Smoke duplicate trash owner ' . $suffix, ['Small']);
-    $duplicate_trash_variation = smoke_create_variation(
-        $duplicate_trash_owner_id,
-        'duplicate-trashed-parent-sku',
-        $duplicate_parent_sku,
-        'Small'
+    $duplicate_owner_a_id = smoke_create_variable_product(
+        'Smoke duplicate owner A ' . $suffix,
+        ['Blue'],
+        $duplicate_parent_sku . '-A'
     );
-    $duplicate_trash_product = wc_get_product($duplicate_trash_variation);
-    smoke_assert($duplicate_trash_product instanceof WC_Product_Variation, 'duplicate trash variation was not created');
-    $duplicate_trash_product->delete(false);
-
-    $duplicate_live_owner_id = smoke_create_variable_product(
-        'Smoke duplicate live owner ' . $suffix,
+    $duplicate_owner_b_id = smoke_create_variable_product(
+        'Smoke duplicate owner B ' . $suffix,
         ['Blue'],
         $duplicate_parent_sku
     );
-    smoke_create_variation($duplicate_live_owner_id, 'duplicate-blue', $duplicate_child_sku, 'Blue');
+    smoke_create_variation($duplicate_owner_b_id, 'duplicate-blue', $duplicate_child_sku, 'Blue');
+
+    global $wpdb;
+    $lookup = $wpdb->prefix . 'wc_product_meta_lookup';
+    $updated = $wpdb->update(
+        $lookup,
+        ['sku' => $duplicate_parent_sku],
+        ['product_id' => $duplicate_owner_a_id]
+    );
+    smoke_assert($updated === 1, 'duplicate lookup fixture did not update the first owner SKU');
     $duplicate_payload = [
         'product_id'  => $initial_id,
         'name'        => 'Smoke initial parent ' . $suffix,
@@ -233,12 +237,51 @@ try {
     sort($duplicate_possible);
     $duplicate_expected = [
         (string) $initial_id,
-        (string) $duplicate_live_owner_id,
-        (string) $duplicate_trash_owner_id,
+        (string) $duplicate_owner_a_id,
+        (string) $duplicate_owner_b_id,
     ];
     sort($duplicate_expected);
     smoke_assert($duplicate_possible === $duplicate_expected, 'duplicate SKU possible_ids did not include every catalog target');
     echo "smoke: duplicated parent SKU rows expose every possible parent\n";
+
+    // Duplicates also matter when the first live SKU row is already the
+    // initial parent: another catalog target behind the duplicated row still
+    // makes the retry ownership state ambiguous.
+    $initial_duplicate_sku = 'SMOKE-INITIAL-DUP-' . $suffix;
+    $initial_duplicate_owner_id = smoke_create_variable_product('Smoke initial duplicate owner ' . $suffix, ['Small']);
+    $initial_duplicate_variation = smoke_create_variation(
+        $initial_duplicate_owner_id,
+        'initial-duplicate-trashed-parent-sku',
+        $initial_duplicate_sku,
+        'Small'
+    );
+    $initial_duplicate_product = wc_get_product($initial_duplicate_variation);
+    smoke_assert($initial_duplicate_product instanceof WC_Product_Variation, 'initial duplicate trash variation was not created');
+    $initial_duplicate_product->delete(false);
+    $updated = $wpdb->update(
+        $lookup,
+        ['sku' => $initial_duplicate_sku],
+        ['product_id' => $initial_id]
+    );
+    smoke_assert($updated === 1, 'initial duplicate lookup fixture did not update the initial parent SKU');
+
+    $initial_duplicate_payload = [
+        'product_id'  => $initial_id,
+        'name'        => 'Smoke initial parent ' . $suffix,
+        'sku'         => $initial_duplicate_sku,
+        'has_variants' => true,
+        'variants'    => [$payload['variants'][1]],
+    ];
+    $initial_duplicate_result = smoke_resolve_row($initial_duplicate_payload);
+    smoke_assert($initial_duplicate_result['canonical_id'] === null, 'initial-owner duplicate rows invented a canonical id');
+    smoke_assert($initial_duplicate_result['sku_conflict_redirect'] === false, 'initial-owner duplicate rows claimed a redirect');
+    smoke_assert($initial_duplicate_result['ambiguous'] === true, 'initial-owner duplicate rows were not ambiguous');
+    $initial_duplicate_possible = array_map('strval', $initial_duplicate_result['possible_ids']);
+    sort($initial_duplicate_possible);
+    $initial_duplicate_expected = [(string) $initial_id, (string) $initial_duplicate_owner_id];
+    sort($initial_duplicate_expected);
+    smoke_assert($initial_duplicate_possible === $initial_duplicate_expected, 'initial-owner duplicate possible_ids mismatch');
+    echo "smoke: duplicate rows behind the initial parent remain ambiguous\n";
 
     echo "SMOKE PASS: variable trash redirect ambiguity\n";
 } catch (Throwable $e) {

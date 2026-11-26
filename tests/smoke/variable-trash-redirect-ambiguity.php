@@ -318,6 +318,77 @@ try {
     smoke_assert($initial_duplicate_possible === $initial_duplicate_expected, 'initial-owner duplicate possible_ids mismatch');
     echo "smoke: duplicate rows behind the initial parent remain ambiguous\n";
 
+    // Case-only differences still collide on WooCommerce's normal
+    // case-insensitive lookup collation.
+    $mixed_case_payload = $parent_child_collision_payload;
+    $mixed_case_payload['variants'][0]['sku'] = strtolower($parent_sku);
+    smoke_assert_ambiguous(
+        smoke_card_resolution($mixed_case_payload),
+        $initial_id,
+        $owner_id,
+        'mixed-case child reusing the trash-only parent SKU'
+    );
+    echo "smoke: mixed-case parent SKU reuse remains ambiguous\n";
+
+    // A live variation under the initial parent can be the primary owner of
+    // the submitted parent SKU. Changing that variation before a later child
+    // collision removes the live row and exposes a trashed fallback owner.
+    $reassign_parent_sku = 'SMOKE-REASSIGN-' . $suffix;
+    $reassign_trash_owner_id = smoke_create_variable_product('Smoke reassignment trash owner ' . $suffix, ['Small']);
+    $reassign_trash_variation = smoke_create_variation(
+        $reassign_trash_owner_id,
+        'reassign-trash-owner',
+        $reassign_parent_sku,
+        'Small'
+    );
+    $reassign_trash_product = wc_get_product($reassign_trash_variation);
+    $reassign_trash_product->delete(false);
+    $reassign_initial_id = smoke_create_variable_product('Smoke reassignment initial ' . $suffix, ['Small', 'Blue']);
+    smoke_create_variation($reassign_initial_id, 'small', $reassign_parent_sku, 'Small');
+    $reassign_payload = [
+        'product_id' => $reassign_initial_id,
+        'name' => 'Smoke reassignment initial ' . $suffix,
+        'sku' => $reassign_parent_sku,
+        'has_variants' => true,
+        'variants' => [
+            ['variant_id' => 'small', 'sku' => $reassign_parent_sku . '-NEW', 'attributes' => ['Size' => 'Small']],
+            ['variant_id' => 'blue', 'sku' => $blocking_child_sku, 'attributes' => ['Size' => 'Blue']],
+        ],
+    ];
+    smoke_assert_ambiguous(
+        smoke_card_resolution($reassign_payload),
+        $reassign_initial_id,
+        $reassign_trash_owner_id,
+        'reassigned initial variation exposing a trash fallback'
+    );
+    echo "smoke: reassigned initial variation exposes fallback ambiguity\n";
+
+    // Restoring a trashed target that still carries the submitted SKU makes a
+    // second live owner before the retry lookup runs.
+    $restore_sku = 'SMOKE-RESTORE-' . $suffix;
+    $restore_child_sku = 'SMOKE-RESTORE-CHILD-' . $suffix;
+    $restore_target_id = smoke_create_variable_product('Smoke restore target ' . $suffix, ['Small'], $restore_sku);
+    $restore_target = wc_get_product($restore_target_id);
+    $restore_target->delete(false);
+    $restore_owner_id = smoke_create_variable_product('Smoke restore live owner ' . $suffix, ['Small'], $restore_sku);
+    smoke_create_variation($restore_owner_id, 'small', $restore_child_sku, 'Small');
+    $restore_payload = [
+        'product_id' => $restore_target_id,
+        'name' => 'Smoke restore target ' . $suffix,
+        'sku' => $restore_sku,
+        'has_variants' => true,
+        'variants' => [
+            ['variant_id' => 'small', 'sku' => $restore_child_sku, 'attributes' => ['Size' => 'Small']],
+        ],
+    ];
+    smoke_assert_ambiguous(
+        smoke_card_resolution($restore_payload),
+        $restore_target_id,
+        $restore_owner_id,
+        'restored trash target colliding with the live SKU owner'
+    );
+    echo "smoke: restored trash target remains ambiguous\n";
+
     echo "SMOKE PASS: variable trash redirect ambiguity\n";
 } catch (Throwable $e) {
     fwrite(STDERR, "SMOKE FAIL: " . $e->getMessage() . "\n");

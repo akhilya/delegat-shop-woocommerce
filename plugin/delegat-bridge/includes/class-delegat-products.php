@@ -717,6 +717,7 @@ final class Delegat_Bridge_Products
             if ($sku !== '') {
                 $owner = self::find_by_sku($sku);
                 if ($owner) {
+                    $sku_owner = $owner;
                     $owner_can_conflict = self::sku_owner_conflicts_with_write($owner);
                     $owner = self::normalize_to_catalog_product($owner);
                     $owner_is_initial = (int) $owner->get_id() === (int) $target->get_id();
@@ -726,8 +727,21 @@ final class Delegat_Bridge_Products
                             $sku_conflict_redirect = true;
                         }
                     } else {
-                        $sku_catalog_target_ids = self::sku_catalog_target_ids($sku);
-                        if (!$owner_is_initial || count($sku_catalog_target_ids) > 1) {
+                        $sku_catalog_tiers = self::sku_catalog_target_id_tiers($sku);
+                        $sku_catalog_target_ids = $sku_catalog_tiers['primary'] !== []
+                            ? $sku_catalog_tiers['primary']
+                            : $sku_catalog_tiers['trash'];
+                        $sku_catalog_possible_ids = array_values(array_unique(array_merge(
+                            $sku_catalog_tiers['primary'],
+                            $sku_catalog_tiers['trash']
+                        )));
+                        $owner_row_is_initial_parent = $owner_is_initial
+                            && (int) $sku_owner->get_id() === (int) $target->get_id();
+                        if (!$owner_is_initial
+                            || count($sku_catalog_target_ids) > 1
+                            || !$owner_row_is_initial_parent
+                            || $target->get_status() === 'trash'
+                        ) {
                             $variable_target = self::resolve_variable_sku_target(
                                 $target,
                                 $owner,
@@ -745,7 +759,7 @@ final class Delegat_Bridge_Products
                                         (string) $target->get_id(),
                                         (string) $owner->get_id(),
                                     ],
-                                    array_map('strval', $sku_catalog_target_ids)
+                                    array_map('strval', $sku_catalog_possible_ids)
                                 )));
                                 $target = null;
                             }
@@ -781,9 +795,9 @@ final class Delegat_Bridge_Products
      * than one id in the applicable tier means LIMIT 1 cannot provide an
      * honest redirect target.
      *
-     * @return int[]
+     * @return array{primary: int[], trash: int[]}
      */
-    private static function sku_catalog_target_ids(string $sku): array
+    private static function sku_catalog_target_id_tiers(string $sku): array
     {
         global $wpdb;
         $lookup = $wpdb->prefix . 'wc_product_meta_lookup';
@@ -803,18 +817,20 @@ final class Delegat_Bridge_Products
         ));
 
         $primary_ids = [];
-        $fallback_ids = [];
+        $trash_ids = [];
         foreach ((array) $rows as $row) {
             $id = (int) $row->catalog_target_id;
             if ((int) $row->primary_lookup === 1) {
                 $primary_ids[] = $id;
             } else {
-                $fallback_ids[] = $id;
+                $trash_ids[] = $id;
             }
         }
-        $ids = $primary_ids !== [] ? $primary_ids : $fallback_ids;
 
-        return array_values(array_unique(array_map('intval', $ids)));
+        return [
+            'primary' => array_values(array_unique(array_map('intval', $primary_ids))),
+            'trash'   => array_values(array_unique(array_map('intval', $trash_ids))),
+        ];
     }
 
     /**
@@ -850,6 +866,12 @@ final class Delegat_Bridge_Products
             && !$hidden_parent_sku_collision
         ) {
             return 'initial';
+        }
+
+        // Restoring a trashed initial parent can itself change the SKU lookup
+        // tier before the child collision and retry.
+        if ($target->get_status() === 'trash') {
+            return 'ambiguous';
         }
 
         // apply_common uses empty(), so the string "0" is not a submitted
@@ -907,11 +929,23 @@ final class Delegat_Bridge_Products
             if ((string) ($variant['variant_id'] ?? '') === '' || empty($variant['sku'])) {
                 continue;
             }
-            if ((string) $variant['sku'] === $parent_sku) {
+            if (self::sku_strings_match((string) $variant['sku'], $parent_sku)) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Compare SKUs conservatively for the case-insensitive collations normally
+     * used by WordPress and WooCommerce lookup tables.
+     */
+    private static function sku_strings_match(string $left, string $right): bool
+    {
+        if ($left === $right) {
+            return true;
+        }
+        return mb_strtolower($left, 'UTF-8') === mb_strtolower($right, 'UTF-8');
     }
 
     /**

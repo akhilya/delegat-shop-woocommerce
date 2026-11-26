@@ -9,6 +9,10 @@ Version numbers match the plugin header. Distribution tags are created in this r
 
 ## [Unreleased]
 
+### Fixed
+
+- Variable card target resolution no longer predicts a SKU-conflict redirect when duplicate SKU lookup rows name multiple catalog products, or when a trash-only parent-SKU owner lets the initial parent claim that SKU before a child-SKU collision. Those retry lookups operate on ambiguous ownership state and now return explicit `ambiguous` plus `possible_ids` evidence instead of a false canonical redirect.
+
 ## [1.3.4] - 2026-11-25
 
 ### Added

@@ -726,16 +726,26 @@ final class Delegat_Bridge_Products
                                 $sku_conflict_redirect = true;
                             }
                         } else {
-                            $variable_target = self::resolve_variable_sku_target($target, $owner, $payload);
+                            $sku_catalog_target_ids = self::sku_catalog_target_ids($sku);
+                            $variable_target = self::resolve_variable_sku_target(
+                                $target,
+                                $owner,
+                                $payload,
+                                $owner_can_conflict,
+                                $sku_catalog_target_ids
+                            );
                             if ($variable_target === 'redirect') {
                                 $target = $owner;
                                 $sku_conflict_redirect = true;
                             } elseif ($variable_target === 'ambiguous') {
                                 $ambiguous = true;
-                                $possible_ids = array_values(array_unique([
-                                    (string) $target->get_id(),
-                                    (string) $owner->get_id(),
-                                ]));
+                                $possible_ids = array_values(array_unique(array_merge(
+                                    [
+                                        (string) $target->get_id(),
+                                        (string) $owner->get_id(),
+                                    ],
+                                    array_map('strval', $sku_catalog_target_ids)
+                                )));
                                 $target = null;
                             }
                         }
@@ -764,18 +774,50 @@ final class Delegat_Bridge_Products
     }
 
     /**
+     * Catalog product ids named by one SKU in the lookup table, with variation
+     * rows normalized to their parents just like the write retry does. More
+     * than one id means LIMIT 1 cannot provide an honest redirect target.
+     *
+     * @return int[]
+     */
+    private static function sku_catalog_target_ids(string $sku): array
+    {
+        global $wpdb;
+        $lookup = $wpdb->prefix . 'wc_product_meta_lookup';
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        $ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT CASE
+                WHEN posts.post_type = 'product_variation' AND parent_posts.ID IS NOT NULL THEN posts.post_parent
+                ELSE posts.ID
+            END
+            FROM {$lookup} AS lookup
+            INNER JOIN {$wpdb->posts} AS posts ON posts.ID = lookup.product_id
+            LEFT JOIN {$wpdb->posts} AS parent_posts ON parent_posts.ID = posts.post_parent
+            WHERE lookup.sku = %s",
+            $sku
+        ));
+
+        return array_values(array_unique(array_map('intval', $ids)));
+    }
+
+    /**
      * Resolve the variable-card branch of a SKU-owner mismatch. A parent SKU
      * conflict itself is swallowed by apply_common; only a child variation SKU
      * conflict can invoke upsert_variable's retry against the parent SKU owner.
      * With full child rows we mirror that collision check against the current
      * database for both the initial parent and the retry parent. Without those
      * rows, or when neither parent can accept the child SKUs, neither side is
-     * honest canonical write evidence.
+     * honest canonical write evidence. Existing duplicate SKU rows cannot
+     * support one redirect target either. A trash-only parent-SKU owner also
+     * cannot support redirect evidence when the writer will submit that SKU:
+     * the initial parent can claim it before the child collision, so the retry
+     * lookup runs against mutated duplicate rows instead of the ownership
+     * state mirrored here.
      *
      * @param array<string, mixed> $payload
      * @return 'initial'|'redirect'|'ambiguous'
      */
-    private static function resolve_variable_sku_target(WC_Product $target, WC_Product $owner, array $payload): string
+    private static function resolve_variable_sku_target(WC_Product $target, WC_Product $owner, array $payload, bool $owner_can_conflict, array $sku_catalog_target_ids): string
     {
         $variants = $payload['variants'] ?? null;
         if (!is_array($variants)) {
@@ -786,6 +828,12 @@ final class Delegat_Bridge_Products
         }
         if (!self::variable_write_has_sku_conflict((int) $target->get_id(), $variants)) {
             return 'initial';
+        }
+
+        // apply_common uses empty(), so the string "0" is not a submitted
+        // parent SKU even though the trim() guard above treats it as present.
+        if (count($sku_catalog_target_ids) > 1 || (!$owner_can_conflict && !empty($payload['sku']))) {
+            return 'ambiguous';
         }
         if (self::variable_conflict_follows_sku_claim((int) $target->get_id(), $variants)) {
             return 'ambiguous';

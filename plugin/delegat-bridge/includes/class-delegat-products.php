@@ -684,33 +684,61 @@ final class Delegat_Bridge_Products
      * behavior, never as duplicate identity.
      *
      * @param array<string, mixed> $payload
-     * @return array{product: ?WC_Product, sku_conflict_redirect: bool}
+     * @return array{product: ?WC_Product, sku_conflict_redirect: bool, ambiguous: bool, possible_ids: list<string>}
      */
     public static function resolve_card_target_with_evidence(array $payload): array
     {
         $target = self::find_existing($payload);
         $sku_conflict_redirect = false;
+        $ambiguous = false;
+        $possible_ids = [];
 
         // Mirror the write path's SKU-conflict correction using the OUTGOING
         // card shape, not the existing product type. upsert_simple retries the
         // save against the SKU owner whenever applying the submitted SKU
         // collides — including when the write is converting an existing
-        // variable product back to simple. upsert_variable is the opposite
-        // branch: apply_common deliberately swallows a parent-SKU conflict, so
-        // a simple product being converted to variable must remain the target
-        // even when the submitted parent SKU belongs somewhere else. When the
-        // primary resolution already is the SKU owner this adjustment is a
-        // no-op.
+        // variable product back to simple. WooCommerce's uniqueness check
+        // excludes posts in trash, while find_by_sku deliberately includes
+        // them for identity resolution and post-conflict retry lookup. A
+        // trash-only owner is therefore never evidence that a simple write
+        // will redirect before that retry happens.
+        //
+        // Variable cards are different: apply_common swallows a parent-SKU
+        // conflict, but a colliding variation SKU can still make upsert_variable
+        // retry against the parent SKU owner. Whether that retry is the actual
+        // destination depends on child Delegat ids/SKUs and on rows already
+        // present under both parents. Full child rows are mirrored against the
+        // current database; omitted rows or a collision that neither parent can
+        // accept are exposed as ambiguity rather than either parent as
+        // definitive write evidence.
         $has_variants = self::payload_has_variants($payload, true);
-        if ($target && !$has_variants) {
+        if ($target) {
             $sku = isset($payload['sku']) ? trim((string) $payload['sku']) : '';
             if ($sku !== '') {
                 $owner = self::find_by_sku($sku);
                 if ($owner) {
+                    $owner_can_conflict = self::sku_owner_conflicts_with_write($owner);
                     $owner = self::normalize_to_catalog_product($owner);
                     if ((int) $owner->get_id() !== (int) $target->get_id()) {
-                        $target = $owner;
-                        $sku_conflict_redirect = true;
+                        if (!$has_variants) {
+                            if ($owner_can_conflict) {
+                                $target = $owner;
+                                $sku_conflict_redirect = true;
+                            }
+                        } else {
+                            $variable_target = self::resolve_variable_sku_target($target, $owner, $payload);
+                            if ($variable_target === 'redirect') {
+                                $target = $owner;
+                                $sku_conflict_redirect = true;
+                            } elseif ($variable_target === 'ambiguous') {
+                                $ambiguous = true;
+                                $possible_ids = array_values(array_unique([
+                                    (string) $target->get_id(),
+                                    (string) $owner->get_id(),
+                                ]));
+                                $target = null;
+                            }
+                        }
                     }
                 }
             }
@@ -719,7 +747,113 @@ final class Delegat_Bridge_Products
         return [
             'product'               => $target,
             'sku_conflict_redirect' => $sku_conflict_redirect,
+            'ambiguous'             => $ambiguous,
+            'possible_ids'          => $possible_ids,
         ];
+    }
+
+    /**
+     * WooCommerce SKU uniqueness ignores trash even though bridge identity
+     * lookup intentionally includes it. Check the object before normalizing a
+     * variation to its parent: the lookup row whose status matters is the SKU
+     * owner itself, not the parent catalog product.
+     */
+    private static function sku_owner_conflicts_with_write(WC_Product $owner): bool
+    {
+        return $owner->get_status() !== 'trash';
+    }
+
+    /**
+     * Resolve the variable-card branch of a SKU-owner mismatch. A parent SKU
+     * conflict itself is swallowed by apply_common; only a child variation SKU
+     * conflict can invoke upsert_variable's retry against the parent SKU owner.
+     * With full child rows we mirror that collision check against the current
+     * database for both the initial parent and the retry parent. Without those
+     * rows, or when neither parent can accept the child SKUs, neither side is
+     * honest canonical write evidence.
+     *
+     * @param array<string, mixed> $payload
+     * @return 'initial'|'redirect'|'ambiguous'
+     */
+    private static function resolve_variable_sku_target(WC_Product $target, WC_Product $owner, array $payload): string
+    {
+        $variants = $payload['variants'] ?? null;
+        if (!is_array($variants)) {
+            return 'ambiguous';
+        }
+        if (!self::variable_card_may_have_sku_collision($payload)) {
+            return 'initial';
+        }
+        if (!self::variable_write_has_sku_conflict((int) $target->get_id(), $variants)) {
+            return 'initial';
+        }
+        if (!self::variable_write_has_sku_conflict((int) $owner->get_id(), $variants)) {
+            return 'redirect';
+        }
+        return 'ambiguous';
+    }
+
+    /**
+     * A variable write can only redirect through a child SKU collision when
+     * the submitted children carry SKUs. The empty() mirror is deliberate:
+     * the writer tests !empty($variant['sku']), so the string "0" is not a
+     * submitted child SKU even though it is non-empty after trim semantics.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private static function variable_card_may_have_sku_collision(array $payload): bool
+    {
+        $variants = $payload['variants'] ?? null;
+        if (!is_array($variants)) {
+            return true;
+        }
+        foreach ($variants as $variant) {
+            if (is_array($variant) && !empty($variant['sku'])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Predict whether save_variable would hit a SKU uniqueness error on one
+     * parent. Variation lookup mirrors the writer exactly: Delegat variant
+     * meta scoped to that parent selects the row being written, while SKU
+     * lookup remains trash-inclusive for identity but trash-exclusive for the
+     * WooCommerce uniqueness conflict itself. Distinct child rows repeating
+     * one SKU inside the same card are also a conflict because the first save
+     * can claim the SKU before the second row runs.
+     *
+     * @param array<int, mixed> $variants
+     */
+    private static function variable_write_has_sku_conflict(int $parent_id, array $variants): bool
+    {
+        $seen_sku_variant_ids = [];
+        foreach ($variants as $variant) {
+            if (!is_array($variant)) {
+                continue;
+            }
+            $delegat_variant_id = (string) ($variant['variant_id'] ?? '');
+            if ($delegat_variant_id === '' || empty($variant['sku'])) {
+                continue;
+            }
+            $sku = (string) $variant['sku'];
+            if (isset($seen_sku_variant_ids[$sku]) && $seen_sku_variant_ids[$sku] !== $delegat_variant_id) {
+                return true;
+            }
+            $seen_sku_variant_ids[$sku] = $delegat_variant_id;
+
+            $target_variation = self::find_variation($parent_id, $delegat_variant_id);
+            $owner = self::find_by_sku($sku);
+            if (!$owner || !self::sku_owner_conflicts_with_write($owner)) {
+                continue;
+            }
+            if ($target_variation && (int) $target_variation->get_id() === (int) $owner->get_id()) {
+                continue;
+            }
+            return true;
+        }
+        return false;
     }
 
     /**

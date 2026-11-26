@@ -14,13 +14,45 @@ final class Delegat_Bridge_Commerce
         }
 
         $ids_param = $request->get_param('ids');
+        if ($ids_param !== null && $ids_param !== '' && !is_string($ids_param)) {
+            return new WP_REST_Response([
+                'success' => false,
+                'error'   => 'ids query parameter contains an invalid product id',
+            ], 400);
+        }
         $ids = [];
-        if (is_string($ids_param) && $ids_param !== '') {
+        $seen = [];
+        if (is_string($ids_param) && trim($ids_param) !== '') {
+            $int_max = (string) PHP_INT_MAX;
             foreach (explode(',', $ids_param) as $part) {
-                $id = absint($part);
-                if ($id > 0) {
-                    $ids[] = $id;
+                $token = trim($part);
+                if (!preg_match('/^\d+$/', $token)) {
+                    return new WP_REST_Response([
+                        'success' => false,
+                        'error'   => 'ids query parameter contains an invalid product id',
+                    ], 400);
                 }
+
+                // Match the batch product read: leading zeroes are aliases of
+                // the same positive integer, while zero and out-of-range input
+                // must never be reinterpreted by a PHP numeric cast.
+                $digits = ltrim($token, '0');
+                if ($digits === ''
+                    || strlen($digits) > strlen($int_max)
+                    || (strlen($digits) === strlen($int_max) && strcmp($digits, $int_max) > 0)
+                ) {
+                    return new WP_REST_Response([
+                        'success' => false,
+                        'error'   => 'ids query parameter contains an invalid product id',
+                    ], 400);
+                }
+
+                $id = (int) $digits;
+                if (isset($seen[$id])) {
+                    continue;
+                }
+                $seen[$id] = true;
+                $ids[] = $id;
             }
         }
 
@@ -56,7 +88,8 @@ final class Delegat_Bridge_Commerce
         // response therefore means the write target genuinely does not exist,
         // unlike the legacy status-filtered listing used for catalog sync.
         $exact = filter_var($request->get_param('exact'), FILTER_VALIDATE_BOOLEAN);
-        if ($exact && $ids !== []) {
+        $exact_mode = $exact && $ids !== [];
+        if ($exact_mode) {
             $product_ids = $ids;
         } else {
             $product_ids = wc_get_products($query_args);
@@ -67,7 +100,7 @@ final class Delegat_Bridge_Commerce
             if (!$product) {
                 continue;
             }
-            $payload = self::price_payload($product);
+            $payload = self::price_payload($product, $exact_mode);
             if ($include_variations && $product->is_type('variable')) {
                 $variants = [];
                 // In exact (write-faithful) mode the variation list must mirror
@@ -83,7 +116,7 @@ final class Delegat_Bridge_Commerce
                 // check at all — including a trashed one. Write-faithful
                 // readback must therefore enumerate every registered status
                 // explicitly so no writable variation is invisible.
-                $variation_ids = $exact && $ids !== []
+                $variation_ids = $exact_mode
                     ? get_posts([
                         'post_type'      => 'product_variation',
                         'post_parent'    => (int) $product->get_id(),
@@ -99,7 +132,7 @@ final class Delegat_Bridge_Commerce
                     if (!$variation instanceof WC_Product_Variation) {
                         continue;
                     }
-                    $variant_payload = self::price_payload($variation);
+                    $variant_payload = self::price_payload($variation, $exact_mode);
                     $delegat_variant_id = get_post_meta((int) $variation->get_id(), Delegat_Bridge_Products::META_VARIANT_ID, true);
                     $variant_payload['variant_id'] = is_string($delegat_variant_id) && $delegat_variant_id !== ''
                         ? $delegat_variant_id
@@ -122,7 +155,7 @@ final class Delegat_Bridge_Commerce
             // status-filtered omission (inconclusive). Bridges predating this
             // field never applied exact mode, and its absence must be read as
             // the legacy filtered semantics.
-            'exact'    => $exact && $ids !== [],
+            'exact'    => $exact_mode,
         ]);
     }
 
@@ -350,16 +383,30 @@ final class Delegat_Bridge_Commerce
     /**
      * @return array<string, mixed>
      */
-    private static function price_payload(WC_Product $product): array
+    private static function price_payload(WC_Product $product, bool $exact = false): array
     {
-        $regular = $product->get_regular_price();
-        $sale = $product->get_sale_price();
+        if ($exact) {
+            // Write-faithful readback compares the stored regular/sale fields
+            // the mutation path writes. In particular, a variable parent's
+            // active price can be WooCommerce's synchronized minimum child
+            // price even when the parent regular price itself is empty, so the
+            // legacy catalog fallback would be false positive evidence here.
+            $regular = $product->get_regular_price('edit');
+            $sale = $product->get_sale_price('edit');
+            $price = $regular !== '' && $regular !== null ? (float) $regular : null;
+            $sale_price = $sale !== '' && $sale !== null ? (float) $sale : null;
+        } else {
+            $regular = $product->get_regular_price();
+            $sale = $product->get_sale_price();
+            $price = $regular !== '' ? (float) $regular : ($product->get_price() !== '' ? (float) $product->get_price() : null);
+            $sale_price = $sale !== '' ? (float) $sale : null;
+        }
         $qty_edit = $product->get_stock_quantity('edit');
         return [
             'external_product_id' => (string) $product->get_id(),
             'sku'                 => (string) $product->get_sku(),
-            'price'               => $regular !== '' ? (float) $regular : ($product->get_price() !== '' ? (float) $product->get_price() : null),
-            'sale_price'          => $sale !== '' ? (float) $sale : null,
+            'price'               => $price,
+            'sale_price'          => $sale_price,
             'quantity'            => $product->get_manage_stock() ? (int) $product->get_stock_quantity() : null,
             // Confirmation-grade stock evidence: view-context getters inherit
             // the parent's quantity and manage flag for variations whose stock

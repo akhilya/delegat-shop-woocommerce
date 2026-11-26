@@ -186,8 +186,10 @@ final class Delegat_Bridge_REST
      * Delegat variant meta under the parent). The adapter uses mutation hits
      * to canonicalize strict ownership aliases before duplicate detection.
      * Card evidence remains shape-faithful, but SKU redirects and cross-form
-     * card aliases are not duplicate identity in the batch contract. This
-     * endpoint never mutates anything.
+     * card aliases are not duplicate identity in the batch contract. Variable
+     * card rows whose child-SKU collision can select a different retry parent
+     * are returned as explicit ambiguity with possible_ids instead of a false
+     * canonical id. This endpoint never mutates anything.
      */
     public static function resolve_rows(WP_REST_Request $request): WP_REST_Response
     {
@@ -206,13 +208,23 @@ final class Delegat_Bridge_REST
                 'found'                 => false,
                 'canonical_id'          => null,
                 'sku_conflict_redirect' => false,
+                'ambiguous'             => false,
+                'possible_ids'          => [],
             ];
             if (is_array($row)) {
                 $kind = (string) ($row['kind'] ?? '');
                 if ($kind === 'card') {
                     $resolution = Delegat_Bridge_Products::resolve_card_target_with_evidence($row);
                     $product = $resolution['product'];
-                    if ($product) {
+                    if (!empty($resolution['ambiguous'])) {
+                        // Several write destinations can remain possible for a
+                        // variable card whose child SKU collision decides the
+                        // retry. Report the candidates without inventing one
+                        // canonical target.
+                        $out['found'] = true;
+                        $out['ambiguous'] = true;
+                        $out['possible_ids'] = array_values(array_map('strval', $resolution['possible_ids'] ?? []));
+                    } elseif ($product) {
                         $out['found'] = true;
                         $out['canonical_id'] = (string) $product->get_id();
                         $out['sku_conflict_redirect'] = (bool) $resolution['sku_conflict_redirect'];
@@ -778,10 +790,11 @@ final class Delegat_Bridge_REST
             }
         }
 
-        // The batch is fully successful only when every row carries an explicit
-        // success=true; an uncertain or missing verdict must degrade the batch
-        // to 207 partial evidence so the adapter reconciles the row.
-        $all_ok = count($results) > 0;
+        // The batch is fully successful when every row carries an explicit
+        // success=true; an uncertain or missing verdict must degrade a non-empty
+        // batch to 207 partial evidence so the adapter reconciles the row. An
+        // empty batch is a no-op: there are no rows that could need reconciliation.
+        $all_ok = true;
         foreach ($results as $r) {
             if (empty($r['success'])) {
                 $all_ok = false;
@@ -918,9 +931,10 @@ final class Delegat_Bridge_REST
             }
         }
 
-        // Fully successful only when every row carries explicit success=true;
-        // uncertain rows degrade the batch to 207 partial evidence.
-        $all_ok = count($results) > 0;
+        // Fully successful when every row carries explicit success=true;
+        // uncertain rows degrade a non-empty batch to 207 partial evidence.
+        // An empty batch is a no-op with no rows to reconcile.
+        $all_ok = true;
         foreach ($results as $r) {
             if (empty($r['success'])) {
                 $all_ok = false;

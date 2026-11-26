@@ -19,6 +19,10 @@ Version numbers match the plugin header. Distribution tags are created in this r
 ### Fixed
 
 - Batch product lookup ids are validated as positive decimal integers before casting. Malformed, zero, and out-of-range tokens are rejected instead of being silently coerced.
+- Exact price readback uses the stored edit-context regular and sale prices written by the mutation path; a variable parent's synchronized active child price is no longer false confirmation evidence.
+- `GET /prices` applies the same strict id-token validation as the batch product lookup.
+- Empty price/stock bulk requests are successful no-ops rather than partial evidence because they contain no rows to reconcile.
+- Simple card target resolution no longer treats a trash-only SKU owner as a write redirect: WooCommerce SKU uniqueness excludes trash. Variable card resolution mirrors child-SKU retry ownership when possible and otherwise returns explicit `ambiguous` plus `possible_ids` evidence instead of a false canonical parent.
 
 ## [1.3.3] - 2026-11-25
 
